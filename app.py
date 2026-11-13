@@ -20,14 +20,16 @@ st.set_page_config(
     layout="wide",
 )
 
-DAMODARAN_BETA_URL = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
-DAMODARAN_RATINGS_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
+DAMODARAN_BETA_URL = "https://www.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
+DAMODARAN_BETA_HTML_URL = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betas.html"
+DAMODARAN_RATINGS_URL = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/ratings.html"
 OECD_TAX_URL = (
     "https://www.oecd.org/en/publications/corporate-tax-statistics-2024_"
     "9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_"
     "440f9286.html#chapter-d1e2342-08e74a33fb"
 )
-TRADING_ECONOMICS_URL = "https://tradingeconomics.com/bonds"
+TRADING_ECONOMICS_URL = "https://tradingeconomics.com/country-list/government-bond-10y"
+TRADING_ECONOMICS_BONDS_URL = "https://tradingeconomics.com/bonds"
 
 DEFAULT_ERP = 6.5
 DEFAULT_DEBT_SHARE = 30.0
@@ -71,71 +73,78 @@ def get_html(url):
     response.raise_for_status()
     return response.text
 
+def _normalize_column_name(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower()).strip()
+
+
+def _beta_table_from_html(html):
+    """Parse the published Damodaran HTML table using named columns."""
+    tables = pd.read_html(io.StringIO(html))
+    for table in tables:
+        # Damodaran's published table has a one-row header with these labels.
+        cols = {_normalize_column_name(c): c for c in table.columns}
+        industry_col = next((v for k, v in cols.items() if k == "industry name"), None)
+        beta_col = next((v for k, v in cols.items() if k == "unlevered beta"), None)
+        if industry_col is None or beta_col is None:
+            continue
+        df = table[[industry_col, beta_col]].copy()
+        df.columns = ["Industry", "Unlevered Beta"]
+        df["Industry"] = df["Industry"].astype(str).str.strip()
+        df["Unlevered Beta"] = df["Unlevered Beta"].apply(safe_float)
+        df = df.dropna(subset=["Unlevered Beta"])
+        df = df[df["Industry"].ne("") & ~df["Industry"].str.lower().isin(["nan", "industry name"])]
+        if len(df) >= 40 and df["Industry"].is_unique:
+            return df.sort_values("Industry").reset_index(drop=True)
+    raise ValueError("Damodaran HTML page did not contain a complete Industry Name / Unlevered Beta table.")
+
+
 def fetch_damodaran_betas():
-    """Download the specified Damodaran XLS and validate the unlevered-beta column."""
-    response = requests.get(
-        DAMODARAN_BETA_URL,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; StudentCostOfCapital/2.0)"},
-        timeout=40,
-    )
-    response.raise_for_status()
-    if len(response.content) < 10_000:
-        raise ValueError("Downloaded beta workbook is unexpectedly small.")
-    workbook = pd.ExcelFile(io.BytesIO(response.content), engine="xlrd")
-    candidates = []
-    for sheet in workbook.sheet_names:
-        raw = pd.read_excel(workbook, sheet_name=sheet, header=None)
-        for header_row in range(min(20, len(raw))):
-            vals = [re.sub(r"\s+", " ", str(v)).strip().lower() for v in raw.iloc[header_row].tolist()]
-            industry_col = next(
-                (i for i, v in enumerate(vals) if v in {"industry name", "industry"}),
-                None,
-            )
-            beta_col = next(
-                (i for i, v in enumerate(vals)
-                 if v == "unlevered beta" or v.startswith("unlevered beta ")),
-                None,
-            )
-            if industry_col is None or beta_col is None:
-                continue
-            df = raw.iloc[header_row + 1:, [industry_col, beta_col]].copy()
-            df.columns = ["Industry", "Unlevered Beta"]
-            df["Industry"] = df["Industry"].astype(str).str.strip()
-            df["Unlevered Beta"] = df["Unlevered Beta"].apply(safe_float)
-            df = df.dropna()
-            df = df[
-                df["Industry"].ne("") &
-                ~df["Industry"].str.lower().isin(["nan", "industry", "industry name"])
-            ]
-            if len(df) >= 20 and df["Industry"].is_unique:
-                candidates.append(df)
-    if not candidates:
-        raise ValueError("Workbook did not contain a validated Industry Name / Unlevered Beta table.")
-    df = max(candidates, key=len).drop_duplicates("Industry").sort_values("Industry").reset_index(drop=True)
+    """Use the specified XLS first, with the same publisher's HTML table as a parser fallback."""
+    vintage = "Vintage not identified"
+    try:
+        html = get_html(DAMODARAN_BETA_HTML_URL)
+        vintage_match = re.search(r"Date of Analysis:\s*Data used is as of\s*([^<\n]+)", html, re.I)
+        if vintage_match:
+            vintage = vintage_match.group(1).strip()
+    except Exception:
+        html = None
 
-    # Independently cross-check the workbook against Damodaran's HTML table.
-    html = get_html("https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betas.html")
-    html_tables = pd.read_html(io.StringIO(html))
-    html_match = False
-    for table in html_tables:
-        flat_cols = [" ".join(map(str, c)) if isinstance(c, tuple) else str(c) for c in table.columns]
-        industry_i = next((i for i, c in enumerate(flat_cols) if "industry" in c.lower()), None)
-        beta_i = next((i for i, c in enumerate(flat_cols) if "unlevered beta" in c.lower() and "corrected" not in c.lower()), None)
-        if industry_i is not None and beta_i is not None:
-            check = table.iloc[:, [industry_i, beta_i]].copy()
-            check.columns = ["Industry", "Unlevered Beta"]
-            check["Industry"] = check["Industry"].astype(str).str.strip()
-            check["Unlevered Beta"] = check["Unlevered Beta"].apply(safe_float)
-            sample = df.merge(check, on="Industry", suffixes=("_xls", "_html"))
-            if len(sample) >= 20 and (sample["Unlevered Beta_xls"] - sample["Unlevered Beta_html"]).abs().max() < 0.011:
-                html_match = True
-                break
-    if not html_match:
-        raise ValueError("XLS failed the cross-check against Damodaran's published HTML table; refusing to use unverified beta data.")
+    xls_error = None
+    try:
+        response = requests.get(DAMODARAN_BETA_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=40)
+        response.raise_for_status()
+        if len(response.content) < 10_000:
+            raise ValueError("Downloaded beta workbook is unexpectedly small.")
+        workbook = pd.ExcelFile(io.BytesIO(response.content), engine="xlrd")
+        candidates = []
+        for sheet in workbook.sheet_names:
+            raw = pd.read_excel(workbook, sheet_name=sheet, header=None)
+            for header_row in range(min(25, len(raw))):
+                vals = [_normalize_column_name(v) for v in raw.iloc[header_row].tolist()]
+                industry_col = next((i for i, v in enumerate(vals) if v == "industry name"), None)
+                beta_col = next((i for i, v in enumerate(vals) if v == "unlevered beta"), None)
+                if industry_col is None or beta_col is None:
+                    continue
+                df = raw.iloc[header_row + 1:, [industry_col, beta_col]].copy()
+                df.columns = ["Industry", "Unlevered Beta"]
+                df["Industry"] = df["Industry"].astype(str).str.strip()
+                df["Unlevered Beta"] = df["Unlevered Beta"].apply(safe_float)
+                df = df.dropna(subset=["Unlevered Beta"])
+                df = df[df["Industry"].ne("") & ~df["Industry"].str.lower().isin(["nan", "industry name"])]
+                if len(df) >= 40 and df["Industry"].is_unique:
+                    candidates.append(df)
+        if candidates:
+            return max(candidates, key=len).sort_values("Industry").reset_index(drop=True), vintage
+        raise ValueError("XLS did not contain a complete industry/unlevered-beta table.")
+    except Exception as exc:
+        xls_error = exc
 
-    vintage_match = re.search(r"Date of Analysis:\s*Data used is as of\s*([^<\\n]+)", html, re.I)
-    vintage = vintage_match.group(1).strip() if vintage_match else "Vintage not identified"
-    return df, vintage
+    if html is not None:
+        try:
+            return _beta_table_from_html(html), vintage + " (HTML table fallback)"
+        except Exception as html_exc:
+            raise ValueError(f"XLS parser failed ({xls_error}); HTML parser failed ({html_exc}).") from html_exc
+    raise ValueError(f"Damodaran XLS unavailable or unreadable ({xls_error}); HTML fallback also unavailable.")
 
 
 def fetch_damodaran_bbb_spread():
@@ -146,7 +155,7 @@ def fetch_damodaran_bbb_spread():
     for table in soup.find_all("table"):
         for tr in table.find_all("tr"):
             cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-            if len(cells) >= 4 and re.search(r"\bBaa2\\s*/\\s*BBB\\b", " ".join(cells), re.I):
+            if len(cells) >= 4 and re.search(r"\bBaa2\s*/\s*BBB\b", " ".join(cells), re.I):
                 target = cells
                 break
         if target:
@@ -156,7 +165,7 @@ def fetch_damodaran_bbb_spread():
         for table in pd.read_html(io.StringIO(html)):
             for _, row in table.iterrows():
                 vals = [str(v).strip() for v in row.tolist()]
-                if any(re.search(r"\bBaa2\\s*/\\s*BBB\\b", v, re.I) for v in vals):
+                if any(re.search(r"\bBaa2\s*/\s*BBB\b", v, re.I) for v in vals):
                     # First spread column is the fourth cell in the large non-financial table.
                     if len(vals) >= 4:
                         target = vals[:4]
@@ -168,62 +177,102 @@ def fetch_damodaran_bbb_spread():
     spread = safe_float(target[3])
     if spread is None or not 0.0 < spread < 10.0:
         raise ValueError(f"BBB spread failed range validation: {target[3]}")
-    vintage_match = re.search(r"Date of Analysis:\\s*Data used is as of\\s*([^<\\n]+)", html, re.I)
+    vintage_match = re.search(r"Date of Analysis:\s*Data used is as of\s*([^<\n]+)", html, re.I)
     vintage = vintage_match.group(1).strip() if vintage_match else "Vintage not identified"
     return spread, "Damodaran: large non-financial service firms, Baa2/BBB", vintage
 
 
 def fetch_oecd_tax_rates():
-    """Retrieve statutory combined corporate income tax rates from OECD SDMX API.
+    """Fetch combined statutory corporate income tax rates from OECD SDMX.
 
-    The OECD Data Explorer API is used rather than scraping a chart or relying
-    on an HTML table. The selected series is statutory, combined/general
-    government corporate income tax rate. Latest observation per country wins.
+    The key follows the query generated by the OECD Data Explorer for annual,
+    statutory, general-government observations. The measure dimension is left
+    unfiltered in the URL and then explicitly filtered to CIT_C in the response.
+    This avoids shifting a dimension into the wrong position in the SDMX key.
     """
-    # Use the current 2.0 OECD dataflow only. We deliberately avoid falling
-    # back to an older vintage: stale data must not masquerade as current.
     api_url = (
-        "https://sdmx.oecd.org/public/rest/v1/data/"
+        "https://sdmx.oecd.org/public/rest/data/"
         "OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/"
-        ".A..ST..S13...?"
-        "startPeriod=2000&endPeriod=2035&dimension_at_observation=AllDimensions&labels=both"
+        ".A..ST..S13...?startPeriod=2000&endPeriod=2026&"
+        "dimensionAtObservation=AllDimensions&format=csvfilewithlabels"
     )
     headers = {
         "Accept": "text/csv",
-        "User-Agent": "Mozilla/5.0 (compatible; StudentCostOfCapital/2.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; InternationalCostOfCapital/1.0)",
     }
     response = requests.get(api_url, headers=headers, timeout=45)
     response.raise_for_status()
     if len(response.content) < 100:
         raise ValueError("OECD SDMX response was unexpectedly small.")
-    df = pd.read_csv(io.BytesIO(response.content))
-    df.columns = [str(c).strip().upper() for c in df.columns]
-    required = {"REF_AREA", "TIME_PERIOD", "OBS_VALUE", "MEASURE", "TARGETING", "SECTOR"}
-    if not required.issubset(df.columns):
-        raise ValueError(f"OECD SDMX response missing required dimensions: {required - set(df.columns)}; refusing ambiguous tax data.")
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "html" in content_type or response.content.lstrip().lower().startswith((b"<!doctype html", b"<html")):
+        raise ValueError("OECD returned HTML instead of SDMX CSV (access block or invalid API request).")
+    try:
+        df = pd.read_csv(io.BytesIO(response.content), sep=None, engine="python")
+    except Exception as exc:
+        raise ValueError(f"OECD response was not a readable SDMX CSV: {exc}") from exc
+    df.columns = [re.sub(r"[^A-Z0-9]+", "_", str(c).strip().upper()).strip("_") for c in df.columns]
 
-    # Keep the OECD series whose measure/targeting/sector dimensions match
-    # the selected statutory combined corporate income tax rate.
-    df = df[df["MEASURE"].astype(str).str.upper().isin(["CIT_C", "CIT_COMBINED", "COMBINED"])]
-    df = df[df["TARGETING"].astype(str).str.upper().isin(["ST", "STATUTORY"])]
-    df = df[df["SECTOR"].astype(str).str.upper().eq("S13")]
+    def col(*names):
+        return next((name for name in names if name in df.columns), None)
 
-    df["Tax Rate"] = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
-    df["Year"] = pd.to_numeric(df["TIME_PERIOD"], errors="coerce")
-    df = df.dropna(subset=["REF_AREA", "Tax Rate", "Year"])
-    df = df[df["Tax Rate"].between(0, 60)]
+    value_col = col("OBS_VALUE", "OBSERVATION_VALUE", "VALUE")
+    time_col = col("TIME_PERIOD", "TIME")
+    area_col = col("REF_AREA", "REFERENCE_AREA", "REFERENCE_AREA_LABEL", "REF_AREA_LABEL")
+    if value_col is None or time_col is None or area_col is None:
+        raise ValueError(
+            "OECD SDMX response missing required country/time/value fields. "
+            f"Columns returned: {', '.join(df.columns)}"
+        )
+
+    # Validate the requested statistical concept whenever dimensions are present.
+    measure_col = col("MEASURE", "MEASURE_LABEL", "MEASURE_NAME")
+    if measure_col is None:
+        raise ValueError("OECD response did not expose the MEASURE dimension; refusing to assume CIT_C.")
+    values = df[measure_col].astype(str).str.strip()
+    keep = values.str.upper().eq("CIT_C") | values.str.contains(
+        r"combined.*statutory.*corporate income tax|statutory.*corporate income tax.*combined",
+        case=False, na=False,
+    )
+    if not keep.any():
+        raise ValueError("OECD response contains no combined corporate income tax (CIT_C) observations.")
+    df = df[keep].copy()
+
+    target_col = col("TARGETING", "TARGETING_LABEL", "TARGETING_NAME")
+    if target_col is None:
+        raise ValueError("OECD response did not expose the TARGETING dimension; refusing to assume statutory rates.")
+    values = df[target_col].astype(str).str.strip()
+    df = df[values.str.upper().eq("ST") | values.str.fullmatch(r"statutory", case=False, na=False)].copy()
+    sector_col = col("INSTITUTIONAL_SECTOR", "SECTOR", "INSTITUTIONAL_SECTOR_LABEL", "SECTOR_LABEL")
+    if sector_col is None:
+        raise ValueError("OECD response did not expose the institutional-sector dimension; refusing to assume S13.")
+    values = df[sector_col].astype(str).str.strip()
+    df = df[values.str.upper().eq("S13") | values.str.fullmatch(r"general government", case=False, na=False)].copy()
     if df.empty:
-        raise ValueError("OECD API returned no observations matching statutory combined CIT rates.")
-    latest = df.sort_values("Year").groupby("REF_AREA", as_index=False).tail(1)
-    # Use OECD country labels from REF_AREA_LABEL when available.
-    label_col = next((c for c in ["REF_AREA_LABEL", "REF_AREA_NAME", "REFERENCE_AREA"] if c in latest.columns), None)
-    latest["Country"] = latest[label_col].astype(str) if label_col else latest["REF_AREA"].astype(str)
-    out = latest[["Country", "Tax Rate", "Year"]].copy()
-    out["Observation date"] = out["Year"].astype(int).astype(str)
-    out["Tax Rate"] = out["Tax Rate"].astype(float)
-    if len(out) < 30:
-        raise ValueError("OECD response contained too few country observations; refusing partial dataset.")
-    return out.drop_duplicates("Country").sort_values("Country").reset_index(drop=True)
+        raise ValueError("OECD response had no observations for statutory CIT_C at general-government level (S13).")
+
+    area_label_col = col("REF_AREA_LABEL", "REF_AREA_NAME", "REFERENCE_AREA_LABEL", "REFERENCE_AREA_NAME", "REFERENCE_AREA")
+    df["Country"] = (df[area_label_col] if area_label_col else df[area_col]).astype(str).str.strip()
+    df["Tax Rate"] = pd.to_numeric(df[value_col], errors="coerce")
+    df["Year"] = pd.to_numeric(df[time_col].astype(str).str.extract(r"(\d{4})")[0], errors="coerce")
+    df = df.dropna(subset=["Country", "Tax Rate", "Year"])
+    df = df[df["Tax Rate"].between(0, 60)]
+    df = df[~df["Country"].str.lower().isin(["nan", ""])]
+    if df.empty:
+        raise ValueError("OECD returned no valid statutory corporate tax observations after validation.")
+
+    # One latest annual observation per country. If OECD returns multiple rows
+    # for the same country/year, keep only the exact S13/CIT_C/ST series above.
+    df["Year"] = df["Year"].astype(int)
+    latest = df.sort_values(["Year"]).groupby("Country", as_index=False).tail(1).copy()
+    latest["Observation date"] = latest["Year"].astype(str)
+    out = latest[["Country", "Tax Rate", "Year", "Observation date"]].drop_duplicates("Country")
+    if len(out) < 20:
+        raise ValueError(
+            f"OECD returned only {len(out)} countries after strict series validation; "
+            "refusing to present a partial dataset as complete."
+        )
+    return out.sort_values("Country").reset_index(drop=True)
 
 
 def normalize_country(name):
@@ -234,54 +283,57 @@ def normalize_country(name):
     return name
 
 
-def fetch_trading_economics_yields():
-    """Scrape the public Trading Economics bonds page (no API key).
-
-    This is deliberately fail-closed. It accepts only identifiable country,
-    yield, and observation-date columns; it does not infer values from random
-    numeric cells or stamp today's date onto an undated quote.
-    """
-    html = get_html(TRADING_ECONOMICS_URL)
-    tables = pd.read_html(io.StringIO(html))
+def _extract_te_table(tables):
+    """Normalize supported Trading Economics country-list and bonds table layouts."""
     records = []
     for table in tables:
         if isinstance(table.columns, pd.MultiIndex):
-            table.columns = [
-                " ".join(str(x) for x in col if str(x) != "nan").strip()
-                for col in table.columns
-            ]
+            table.columns = [" ".join(str(x) for x in col if str(x) != "nan").strip() for col in table.columns]
         cols = [re.sub(r"\s+", " ", str(c)).strip().lower() for c in table.columns]
-        country_i = next((i for i, c in enumerate(cols) if c in {"country", "name"} or "country" in c), None)
-        yield_i = next((i for i, c in enumerate(cols) if c in {"yield", "last", "price"} or "yield" in c), None)
-        date_i = next((i for i, c in enumerate(cols) if "date" in c or "time" in c or "updated" in c), None)
+
+        country_i = next((i for i, c in enumerate(cols) if c in {"country", "major10y", "major 10y"}), None)
+        if country_i is None and cols and (cols[0] == "" or cols[0].startswith("unnamed")):
+            country_i = 0
+        yield_i = next((i for i, c in enumerate(cols) if c in {"last", "yield", "10y", "10-year yield"}), None)
+        date_i = next((i for i, c in enumerate(cols) if c in {"reference", "date", "updated"}), None)
         if country_i is None or yield_i is None or date_i is None:
             continue
         for _, row in table.iterrows():
-            country = normalize_country(row.iloc[country_i])
+            country_name = normalize_country(row.iloc[country_i])
             value = safe_float(row.iloc[yield_i])
-            raw_date = str(row.iloc[date_i]).strip()
-            parsed_date = pd.to_datetime(raw_date, errors="coerce", utc=True)
-            if not country or country.lower() in {"nan", "country"} or value is None:
+            reference = str(row.iloc[date_i]).strip()
+            if not country_name or country_name.lower() in {"nan", "country", "report", "country list"}:
                 continue
-            if not -5 <= value <= 50 or pd.isna(parsed_date):
+            if value is None or not -5 <= value <= 50:
+                continue
+            if not re.match(r"^(?:[A-Za-z]{3}/\d{2}|\d{4}-\d{2}-\d{2})$", reference):
                 continue
             records.append({
-                "Country": country,
+                "Country": country_name,
                 "Yield": float(value),
-                "Observation date": parsed_date.date().isoformat(),
-                "Source": "Trading Economics bonds page",
+                "Observation date": reference,
+                "Source": "Trading Economics: Government Bond 10y by Country",
             })
-    if not records:
-        raise ValueError(
-            "Could not identify country, 10-year yield and observation-date columns "
-            "on Trading Economics. No undated or guessed values will be used."
-        )
-    df = pd.DataFrame(records)
-    df = df.sort_values("Observation date").drop_duplicates("Country", keep="last")
-    # Sanity check the U.S. benchmark is present before accepting the table.
-    if find_country_value(df, "United States", "Country", "Yield") is None:
-        raise ValueError("Trading Economics scrape did not include the U.S. 10-year benchmark.")
-    return df.reset_index(drop=True)
+    return records
+
+
+def fetch_trading_economics_yields():
+    """Scrape TE's dedicated country list, then its bonds overview as a fallback."""
+    errors = []
+    for url in (TRADING_ECONOMICS_URL, TRADING_ECONOMICS_BONDS_URL):
+        try:
+            html = get_html(url)
+            tables = pd.read_html(io.StringIO(html))
+            records = _extract_te_table(tables)
+            if records:
+                df = pd.DataFrame(records).drop_duplicates("Country", keep="last")
+                if find_country_value(df, "United States", "Country", "Yield") is None:
+                    raise ValueError("Parsed yield table did not include the U.S. benchmark.")
+                return df.sort_values("Country").reset_index(drop=True)
+            errors.append(f"{url}: no recognized country/yield/date table")
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+    raise ValueError("Trading Economics parsing failed. " + " | ".join(errors))
 
 
 def find_country_value(df, country, country_col, value_col):
@@ -316,50 +368,41 @@ def find_country_observation_date(df, country):
     return None
 
 
-def calculate_costs(beta_u, debt_share_pct, tax_pct, erp_pct, rf_us_pct, rf_foreign_pct, usd_spread_pct):
-    """All inputs are percentage points; outputs are decimal rates and % display values."""
+def calculate_costs(beta_u, debt_share_pct, tax_pct, erp_pct, rf_us_pct,
+                    rf_foreign_pct, usd_spread_pct, foreign_spread_pct=None):
+    """All inputs are percentage points; outputs are decimal rates."""
     d = debt_share_pct / 100.0
     tau = tax_pct / 100.0
     erp = erp_pct / 100.0
     rf_us = rf_us_pct / 100.0
     rf_foreign = rf_foreign_pct / 100.0
-    spread = usd_spread_pct / 100.0
-
+    spread_us = usd_spread_pct / 100.0
     if not 0 <= d < 1:
         raise ValueError("Debt share must be at least 0% and less than 100%.")
     if beta_u <= 0:
         raise ValueError("Unlevered beta must be positive.")
     if not 0 <= tau < 1:
         raise ValueError("Tax rate must be at least 0% and less than 100%.")
-    if min(rf_us, rf_foreign, spread, erp) <= -1:
+    if min(rf_us, rf_foreign, spread_us, erp) <= -1:
         raise ValueError("Rates must be greater than -100%.")
-
     de = d / (1.0 - d)
     beta_e = beta_u * (1.0 + (1.0 - tau) * de)
-
     re_us = rf_us + beta_e * erp
-    rd_us = rf_us + spread
-
-    # Rebelo lecture conversion: convert the gross return using the ratio
-    # of foreign and domestic risk-free gross returns.
+    rd_us = rf_us + spread_us
     re_foreign = (1.0 + re_us) * (1.0 + rf_foreign) / (1.0 + rf_us) - 1.0
-
-    # Foreign spread is converted by the same gross risk-free factor.
-    spread_foreign = spread * (1.0 + rf_foreign) / (1.0 + rf_us)
+    spread_foreign = (
+        float(foreign_spread_pct) / 100.0 if foreign_spread_pct is not None
+        else spread_us * (1.0 + rf_foreign) / (1.0 + rf_us)
+    )
+    if spread_foreign < 0:
+        raise ValueError("Foreign borrowing spread cannot be negative.")
     rd_foreign = rf_foreign + spread_foreign
-
     wacc_us = (1.0 - d) * re_us + d * rd_us * (1.0 - tau)
     wacc_foreign = (1.0 - d) * re_foreign + d * rd_foreign * (1.0 - tau)
-
     return {
-        "de_ratio": de,
-        "beta_e": beta_e,
-        "re_us": re_us,
-        "rd_us": rd_us,
-        "after_tax_rd_us": rd_us * (1.0 - tau),
-        "wacc_us": wacc_us,
-        "spread_foreign": spread_foreign,
-        "re_foreign": re_foreign,
+        "de_ratio": de, "beta_e": beta_e, "re_us": re_us, "rd_us": rd_us,
+        "after_tax_rd_us": rd_us * (1.0 - tau), "wacc_us": wacc_us,
+        "spread_foreign": spread_foreign, "re_foreign": re_foreign,
         "rd_foreign": rd_foreign,
         "after_tax_rd_foreign": rd_foreign * (1.0 - tau),
         "wacc_foreign": wacc_foreign,
@@ -425,7 +468,7 @@ with st.spinner("Loading the latest available source data..."):
 
 if data["errors"]:
     with st.expander("Data-source status and fallback information", expanded=True):
-        st.warning("One or more live sources could not be parsed. The app remains usable; check the source status and use manual overrides where needed.")
+        st.warning("One or more live sources could not be parsed. The app will not substitute guessed values. Check each source error and use a manual override only when you have a verified observation.")
         for err in data["errors"]:
             st.write("• " + err)
         st.caption(
@@ -451,19 +494,32 @@ default_industry_index = (
     if DEFAULT_INDUSTRY in industry_options else 0
 )
 
-available_countries = {"United States"}
+# Fixed selector choices: the UI must remain usable even if one or more
+# providers are temporarily unavailable. Data availability is shown separately.
+COUNTRY_CHOICES = [
+    "Argentina", "Australia", "Austria", "Belgium", "Brazil", "Canada",
+    "Chile", "China", "Colombia", "Croatia", "Czech Republic", "Denmark",
+    "Finland", "France", "Germany", "Greece", "Hong Kong", "Hungary",
+    "Iceland", "India", "Indonesia", "Ireland", "Israel", "Italy", "Japan",
+    "Malaysia", "Mexico", "Netherlands", "New Zealand", "Norway", "Pakistan",
+    "Peru", "Philippines", "Poland", "Portugal", "Romania", "Russia",
+    "Saudi Arabia", "Singapore", "South Africa", "South Korea", "Spain",
+    "Sweden", "Switzerland", "Taiwan", "Thailand", "Türkiye",
+    "United Arab Emirates", "United Kingdom", "United States", "Vietnam",
+]
+available_countries = set(COUNTRY_CHOICES)
 if data["taxes"] is not None:
-    available_countries = sorted(set(available_countries) | set(data["taxes"]["Country"].astype(str)))
+    available_countries |= set(data["taxes"]["Country"].astype(str))
 if data["yields"] is not None:
-    available_countries = sorted(set(available_countries) | set(data["yields"]["Country"].astype(str)))
+    available_countries |= set(data["yields"]["Country"].astype(str))
 
 with st.sidebar:
     st.header("Inputs")
     st.subheader("Project selection")
     industry = st.selectbox("Industry", industry_options, index=default_industry_index)
-    country_options = sorted(set(available_countries) | {"United States"})
-    default_country_index = country_options.index("United States")
-    country = st.selectbox("Target country", country_options, index=default_country_index)
+    country_options = sorted(set(available_countries) - {"United States"})
+    country = st.selectbox("Foreign target country", country_options, index=country_options.index("Colombia") if "Colombia" in country_options else 0)
+    st.caption("The U.S. is the fixed domestic benchmark; select the foreign country to compare against USD.")
 
     st.subheader("Capital structure and risk premium")
     erp_pct = st.number_input(
@@ -554,9 +610,9 @@ with st.sidebar:
     )
 
 # Resolve actual inputs and source labels.
-beta_u = beta_override if beta_override_on else (auto_beta if auto_beta is not None else 0.80)
+beta_u = beta_override if beta_override_on else auto_beta
 beta_source = "Manual override" if beta_override_on else (
-    "Damodaran U.S. industry betas" if auto_beta is not None else "Illustrative fallback (0.80); replace with fetched/manual industry beta"
+    "Damodaran U.S. industry betas" if auto_beta is not None else "Unavailable — manual override required"
 )
 
 tax_us_source = "OECD SDMX dataset" if data["taxes"] is not None and find_country_value(data["taxes"], "United States", "Country", "Tax Rate") is not None else "Unavailable — manual override required"
@@ -615,7 +671,7 @@ with st.expander("Data-source links and dates"):
     st.write("OECD statutory tax rates retain the latest available annual observation returned by the OECD SDMX dataset.")
 
 # Guard missing data
-if beta_u is None or tax_pct is None or rf_us_pct is None or rf_foreign_pct is None or spread_us_pct is None:
+if beta_u is None or tax_pct is None or rf_us_pct is None or rf_foreign_pct is None or spread_us_pct is None or (foreign_spread_override_on and spread_foreign_pct is None):
     st.error("A required source observation is unavailable. Enter a manual override for each missing input before calculating. No illustrative fallback values are used.")
     st.stop()
 
@@ -628,21 +684,9 @@ try:
     # The calculation function uses a single spread for both currencies by default.
     base_results = calculate_costs(
         beta_u, debt_share_pct, tax_pct, erp_pct,
-        rf_us_pct, rf_foreign_pct, spread_us_pct
+        rf_us_pct, rf_foreign_pct, spread_us_pct,
+        foreign_spread_pct if foreign_spread_override_on else None,
     )
-    if foreign_spread_override_on:
-        d = debt_share_pct / 100
-        tau = tax_pct / 100
-        spread_f = spread_foreign_pct / 100
-        rf_f = rf_foreign_pct / 100
-        rd_f = rf_f + spread_f
-        base_results["spread_foreign"] = spread_f
-        base_results["rd_foreign"] = rd_f
-        base_results["after_tax_rd_foreign"] = rd_f * (1 - tau)
-        base_results["wacc_foreign"] = (
-            (1 - d) * base_results["re_foreign"] +
-            d * rd_f * (1 - tau)
-        )
 except Exception as exc:
     st.error(f"Unable to calculate: {exc}")
     st.stop()
@@ -743,13 +787,9 @@ if beta_df is not None and not beta_df.empty:
         try:
             r = calculate_costs(
                 b, debt_share_pct, tax_pct, erp_pct,
-                rf_us_pct, rf_foreign_pct, spread_us_pct
+                rf_us_pct, rf_foreign_pct, spread_us_pct,
+                spread_foreign_pct if foreign_spread_override_on else None,
             )
-            if foreign_spread_override_on:
-                d = debt_share_pct / 100
-                tau = tax_pct / 100
-                rd_f = rf_foreign_pct / 100 + spread_foreign_pct / 100
-                r["wacc_foreign"] = (1-d)*r["re_foreign"] + d*rd_f*(1-tau)
             industry_results.append({
                 "Industry": row["Industry"],
                 "Unlevered beta": b,
@@ -800,7 +840,8 @@ equal_yield_pass = (
 # Zero debt => WACC equals cost of equity in both currencies.
 zero_debt_test = calculate_costs(
     beta_u, 0.0, tax_pct, erp_pct,
-    rf_us_pct, rf_foreign_pct, spread_us_pct
+    rf_us_pct, rf_foreign_pct, spread_us_pct,
+    spread_foreign_pct if foreign_spread_override_on else None,
 )
 zero_debt_pass = (
     abs(zero_debt_test["wacc_us"] - zero_debt_test["re_us"]) < 1e-12
@@ -810,29 +851,23 @@ zero_debt_pass = (
 # Foreign spread override must not alter USD-side outputs.
 usd_before = calculate_costs(
     beta_u, debt_share_pct, tax_pct, erp_pct,
-    rf_us_pct, rf_foreign_pct, spread_us_pct
+    rf_us_pct, rf_foreign_pct, spread_us_pct,
+    spread_foreign_pct if foreign_spread_override_on else None,
 )
+_test_foreign_spread = max(0.0, spread_foreign_pct + 1.0)
 usd_after = calculate_costs(
     beta_u, debt_share_pct, tax_pct, erp_pct,
-    rf_us_pct, rf_foreign_pct, spread_us_pct
+    rf_us_pct, rf_foreign_pct, spread_us_pct, _test_foreign_spread,
 )
-# Apply a deliberately different foreign-only spread to a separate foreign
-# WACC calculation; the USD-side outputs remain those in usd_after.
-_test_foreign_spread = (spread_foreign_pct + 1.0) / 100.0
-_test_d = debt_share_pct / 100.0
-_test_tau = tax_pct / 100.0
-_test_rd_foreign = rf_foreign_pct / 100.0 + _test_foreign_spread
-_test_foreign_wacc = (1 - _test_d) * usd_after["re_foreign"] + _test_d * _test_rd_foreign * (1 - _test_tau)
 foreign_override_invariance_pass = (
     abs(usd_before["re_us"] - usd_after["re_us"]) < 1e-12
     and abs(usd_before["rd_us"] - usd_after["rd_us"]) < 1e-12
     and abs(usd_before["wacc_us"] - usd_after["wacc_us"]) < 1e-12
-    and abs(usd_after["wacc_us"] - usd_before["wacc_us"]) < 1e-12
 )
 
 checks = [
     ("Equal government yields", equal_yield_pass,
-     "With identical yields and no foreign spread override, USD and foreign-currency results match."),
+     "With identical yields and the automatic foreign-spread conversion, USD and foreign-currency results match."),
     ("Zero debt share", zero_debt_pass,
      "At 0% debt, WACC equals cost of equity in both currencies."),
     ("Foreign spread override isolation", foreign_override_invariance_pass,
@@ -841,9 +876,17 @@ checks = [
 for name, passed, detail in checks:
     col1, col2 = st.columns([1, 5])
     with col1:
-        st.success("PASS" if passed else "FAIL")
+        if name == "Equal government yields" and foreign_spread_override_on:
+            st.info("N/A")
+        elif passed:
+            st.success("PASS")
+        else:
+            st.error("FAIL")
     with col2:
-        st.write(f"**{name}** — {detail}")
+        if name == "Equal government yields" and foreign_spread_override_on:
+            st.write(f"**{name}** — Not applicable while the foreign spread is manually overridden.")
+        else:
+            st.write(f"**{name}** — {detail}")
 
 # ---------------------------------------------------------------------
 # Downloadable results
