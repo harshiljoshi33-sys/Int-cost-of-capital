@@ -211,7 +211,12 @@ def fetch_oecd_tax_rates():
         df = pd.read_csv(io.BytesIO(response.content), sep=None, engine="python")
     except Exception as exc:
         raise ValueError(f"OECD response was not a readable SDMX CSV: {exc}") from exc
-    df.columns = [re.sub(r"[^A-Z0-9]+", "_", str(c).strip().upper()).strip("_") for c in df.columns]
+    # Normalize headers, then drop duplicate names. Some SDMX CSV responses
+    # include both code and label columns that normalize to the same name;
+    # pandas df["NAME"] would then return a DataFrame, not a Series.
+    normalized = [re.sub(r"[^A-Z0-9]+", "_", str(c).strip().upper()).strip("_") for c in df.columns]
+    df.columns = normalized
+    df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")].copy()
 
     def col(*names):
         return next((name for name in names if name in df.columns), None)
@@ -528,7 +533,7 @@ with st.sidebar:
     )
     debt_share_pct = st.slider(
         "Target debt share (%)", min_value=0.0, max_value=90.0,
-        value=DEFAULT_DEBT_SHARE, step=1
+        value=float(DEFAULT_DEBT_SHARE), step=1.0
     )
 
     st.subheader("Project tax rate")
