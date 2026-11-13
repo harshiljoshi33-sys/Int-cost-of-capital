@@ -300,7 +300,7 @@ def _extract_te_table(tables):
             re.sub(r"[^a-z0-9]+", " ", str(c).casefold()).strip()
             for c in table.columns
         ]
-        cols = [re.sub(r"\\s+", " ", c) for c in cols]
+        cols = [re.sub(r"\s+", " ", c) for c in cols]
 
         country_i = next(
             (i for i, c in enumerate(cols)
@@ -352,13 +352,89 @@ def fetch_trading_economics_yields():
                 df = pd.DataFrame(records).drop_duplicates("Country", keep="last")
                 if find_country_value(df, "United States", "Country", "Yield") is None:
                     raise ValueError("Parsed yield table did not include the U.S. benchmark.")
-                if find_country_value(df, "Colombia", "Country", "Yield") is None:
-                    raise ValueError("Parsed yield table did not include Colombia; refusing partial country coverage.")
                 return df.sort_values("Country").reset_index(drop=True)
             errors.append(f"{url}: no recognized country/yield/date table")
         except Exception as exc:
             errors.append(f"{url}: {exc}")
     raise ValueError("Trading Economics parsing failed. " + " | ".join(errors))
+
+
+
+def trading_economics_country_slug(country):
+    """Map display country names to Trading Economics URL slugs."""
+    aliases = {
+        "United States": "united-states",
+        "South Korea": "south-korea",
+        "South Africa": "south-africa",
+        "New Zealand": "new-zealand",
+        "United Kingdom": "united-kingdom",
+        "United Arab Emirates": "united-arab-emirates",
+        "Czech Republic": "czech-republic",
+        "Hong Kong": "hong-kong",
+        "Türkiye": "turkey",
+    }
+    return aliases.get(country, re.sub(r"[^a-z0-9]+", "-", country.casefold()).strip("-"))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_trading_economics_country_yield(country):
+    """
+    Fetch a selected country's dedicated Trading Economics 10-year bond page.
+    The all-country table is preferred; this is a country-specific fallback.
+    """
+    slug = trading_economics_country_slug(country)
+    url = f"https://tradingeconomics.com/{slug}/government-bond-yield"
+    html = get_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    # First try the dedicated bond quote table, commonly labelled 'Colombia 10Y | 12.71'.
+    for table in pd.read_html(io.StringIO(html)):
+        for _, row in table.iterrows():
+            cells = [str(v).strip() for v in row.tolist()]
+            if not cells:
+                continue
+            label = " ".join(cells[:2]).casefold()
+            if "10y" in label or "10-year" in label:
+                for value in cells[1:]:
+                    parsed = safe_float(value)
+                    if parsed is not None and -5 <= parsed <= 50:
+                        # Use the page's narrative observation date, not the crawl date.
+                        page_text = soup.get_text(" ", strip=True)
+                        date_match = re.search(
+                            r"(?:to|at)\s+[0-9]+(?:\.[0-9]+)?%?\s+on\s+"
+                            r"([A-Z][a-z]+\s+\d{1,2},\s+\d{4})",
+                            page_text,
+                        )
+                        obs_date = date_match.group(1) if date_match else "Date not identified"
+                        return pd.DataFrame([{
+                            "Country": country,
+                            "Yield": float(parsed),
+                            "Observation date": obs_date,
+                            "Source": "Trading Economics: country-specific 10-year government bond page",
+                        }])
+
+    # Fallback to the summary sentence, e.g. "eased to 12.71% on November 12, 2026".
+    page_text = soup.get_text(" ", strip=True)
+    patterns = [
+        r"(?:eased|rose|increased|decreased|climbed|fell|advanced|declined|stood|traded|reached)"
+        r"\s+to\s+([0-9]+(?:\.[0-9]+)?)%\s+on\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})",
+        r"([0-9]+(?:\.[0-9]+)?)%\s+on\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, page_text, flags=re.IGNORECASE)
+        if match:
+            value = safe_float(match.group(1))
+            if value is not None and -5 <= value <= 50:
+                return pd.DataFrame([{
+                    "Country": country,
+                    "Yield": float(value),
+                    "Observation date": match.group(2),
+                    "Source": "Trading Economics: country-specific 10-year government bond page",
+                }])
+
+    raise ValueError(
+        f"Could not identify a dated 10-year yield on the Trading Economics page for {country}."
+    )
 
 
 def find_country_value(df, country, country_col, value_col):
@@ -576,7 +652,28 @@ with st.sidebar:
 # Yield lookup
 auto_us_yield = find_country_value(data["yields"], "United States", "Country", "Yield") if data["yields"] is not None else None
 auto_foreign_yield = find_country_value(data["yields"], country, "Country", "Yield") if data["yields"] is not None else None
-# Missing live observations remain missing; manual override is required.
+foreign_yield_source_df = data["yields"]
+foreign_yield_from_country_page = False
+# If the world table is incomplete for the selected country, query that country's
+# dedicated Trading Economics page instead of treating the partial table as complete.
+if auto_foreign_yield is None:
+    try:
+        selected_country_yield_df = fetch_trading_economics_country_yield(country)
+        auto_foreign_yield = safe_float(selected_country_yield_df.iloc[0]["Yield"])
+        foreign_yield_from_country_page = True
+        if foreign_yield_source_df is None:
+            foreign_yield_source_df = selected_country_yield_df
+        else:
+            foreign_yield_source_df = pd.concat(
+                [foreign_yield_source_df, selected_country_yield_df],
+                ignore_index=True,
+            ).drop_duplicates("Country", keep="last")
+    except Exception as exc:
+        data["errors"].append(f"Trading Economics selected-country fallback ({country}): {exc}")
+auto_foreign_yield_date = (
+    find_country_observation_date(foreign_yield_source_df, country)
+    if foreign_yield_source_df is not None else None
+)
 bbb_auto = data["bbb_spread"]
 
 with st.sidebar:
@@ -710,65 +807,89 @@ if usd_ready:
         foreign_ready = False
         base_results = None
 
+# ISO currency labels for the comparison dashboard.
+CURRENCY_CODES = {
+    "Argentina": "ARS", "Australia": "AUD", "Austria": "EUR", "Belgium": "EUR",
+    "Brazil": "BRL", "Canada": "CAD", "Chile": "CLP", "China": "CNY",
+    "Colombia": "COP", "Croatia": "EUR", "Czech Republic": "CZK", "Denmark": "DKK",
+    "Finland": "EUR", "France": "EUR", "Germany": "EUR", "Greece": "EUR",
+    "Hong Kong": "HKD", "Hungary": "HUF", "Iceland": "ISK", "India": "INR",
+    "Indonesia": "IDR", "Ireland": "EUR", "Israel": "ILS", "Italy": "EUR",
+    "Japan": "JPY", "Malaysia": "MYR", "Mexico": "MXN", "Netherlands": "EUR",
+    "New Zealand": "NZD", "Norway": "NOK", "Pakistan": "PKR", "Peru": "PEN",
+    "Philippines": "PHP", "Poland": "PLN", "Portugal": "EUR", "Romania": "RON",
+    "Russia": "RUB", "Saudi Arabia": "SAR", "Singapore": "SGD", "South Africa": "ZAR",
+    "South Korea": "KRW", "Spain": "EUR", "Sweden": "SEK", "Switzerland": "CHF",
+    "Taiwan": "TWD", "Thailand": "THB", "Türkiye": "TRY",
+    "United Arab Emirates": "AED", "United Kingdom": "GBP", "Vietnam": "VND",
+    "United States": "USD",
+}
+foreign_currency_code = CURRENCY_CODES.get(country, "local currency")
+
 # ---------------------------------------------------------------------
 # Main dashboard: always visible, even when a source is unavailable.
 # ---------------------------------------------------------------------
-st.header("Cost of capital dashboard")
+st.header("Cost of capital comparison")
 tax_caption = (
     f"{tax_pct:.2f}% ({tax_source_choice})"
     if tax_pct is not None else f"Unavailable ({tax_source_choice})"
 )
-st.caption(f"{industry} | United States vs. {country} | Project tax rate: {tax_caption}")
+st.caption(
+    f"{industry}  ·  USD vs. {foreign_currency_code}  ·  "
+    f"Project tax rate: {tax_caption}"
+)
 
-def display_metric(value, is_decimal_rate=True):
+def display_metric(value):
     if value is None:
-        return "Unavailable"
-    number = pct_from_decimal(value) if is_decimal_rate else value
-    return f"{number:.2f}%" if is_decimal_rate else f"{number:.4f}"
+        return "Awaiting input"
+    return f"{pct_from_decimal(value):.2f}%"
 
-usd_col, foreign_col = st.columns(2)
+usd_col, foreign_col = st.columns(2, gap="large")
 with usd_col:
-    st.subheader("🇺🇸 U.S. dollars (USD)")
-    if base_results is None:
-        st.metric("Cost of equity", "Unavailable")
-        st.metric("Pre-tax cost of debt", "Unavailable")
-        st.metric("After-tax cost of debt", "Unavailable")
-        st.metric("WACC", "Unavailable")
-    else:
-        st.metric("Cost of equity", display_metric(base_results["re_us"]))
-        st.metric("Pre-tax cost of debt", display_metric(base_results["rd_us"]))
-        st.metric("After-tax cost of debt", display_metric(base_results["after_tax_rd_us"]))
-        st.metric("WACC", display_metric(base_results["wacc_us"]))
+    with st.container(border=True):
+        st.subheader("United States · USD")
+        if base_results is None:
+            st.metric("Weighted average cost of capital", "Unavailable")
+            st.caption("Cost of equity and debt costs are unavailable until required USD inputs are supplied.")
+        else:
+            st.metric("Weighted average cost of capital", display_metric(base_results["wacc_us"]))
+            st.divider()
+            st.metric("Cost of equity", display_metric(base_results["re_us"]))
+            st.metric("Pre-tax cost of debt", display_metric(base_results["rd_us"]))
+            st.metric("After-tax cost of debt", display_metric(base_results["after_tax_rd_us"]))
 
 with foreign_col:
-    st.subheader(f"🌎 {country} currency")
-    if not foreign_ready or base_results is None:
-        st.metric("Cost of equity", "Unavailable")
-        st.metric("Pre-tax cost of debt", "Unavailable")
-        st.metric("After-tax cost of debt", "Unavailable")
-        st.metric("WACC", "Unavailable")
-    else:
-        st.metric("Cost of equity", display_metric(base_results["re_foreign"]))
-        st.metric("Pre-tax cost of debt", display_metric(base_results["rd_foreign"]))
-        st.metric("After-tax cost of debt", display_metric(base_results["after_tax_rd_foreign"]))
-        st.metric("WACC", display_metric(base_results["wacc_foreign"]))
+    with st.container(border=True):
+        st.subheader(f"{country} · {foreign_currency_code}")
+        if not foreign_ready or base_results is None:
+            st.metric("Weighted average cost of capital", "Awaiting input")
+            st.divider()
+            st.metric("Cost of equity", "Awaiting input")
+            st.metric("Pre-tax cost of debt", "Awaiting input")
+            st.metric("After-tax cost of debt", "Awaiting input")
+        else:
+            st.metric("Weighted average cost of capital", display_metric(base_results["wacc_foreign"]))
+            st.divider()
+            st.metric("Cost of equity", display_metric(base_results["re_foreign"]))
+            st.metric("Pre-tax cost of debt", display_metric(base_results["rd_foreign"]))
+            st.metric("After-tax cost of debt", display_metric(base_results["after_tax_rd_foreign"]))
 
 if not usd_ready:
     st.warning(
-        "USD results are unavailable because these required inputs are missing: "
+        "U.S. dollar results are unavailable because these required inputs are missing: "
         + ", ".join(missing_inputs)
-        + ". Enter verified manual overrides in the sidebar. The dashboard remains available."
+        + ". Enter verified manual overrides in the sidebar."
     )
 elif not foreign_ready:
     st.info(
-        f"USD results are available. {country} results are waiting for: "
+        f"U.S. dollar results are available. {country} results are waiting for: "
         + ", ".join(foreign_missing)
-        + ". Enter a verified manual override in the sidebar."
+        + ". You can enter a verified manual override in the sidebar."
     )
 
 st.caption(
-    "Adjust assumptions and manual overrides in the left sidebar. "
-    "Source diagnostics, supporting analysis and verification checks are kept below."
+    "Change project assumptions and overrides in the sidebar. "
+    "Source details, comparison tables, validation checks and downloads are below."
 )
 
 with st.expander("Technical details & validation", expanded=False):
@@ -787,8 +908,8 @@ with st.expander("Technical details & validation", expanded=False):
     source_rows = [
         ["Industry unlevered beta", beta_u, beta_source, "Damodaran beta workbook", f"Damodaran vintage: {data.get('beta_vintage') or 'Unavailable'}"],
         ["Project corporate tax rate", tax_pct, f"{tax_source}; chosen: {tax_source_choice}", "OECD statutory corporate tax rates", f"U.S. year: {find_country_year(data['taxes'], 'United States')}; selected-country year: {find_country_year(data['taxes'], country)}"],
-        ["U.S. 10-year government yield", rf_us_pct, "Trading Economics" if data["yields"] is not None and not us_yield_override_on else ("Manual override" if us_yield_override_on else "Unavailable"), "Trading Economics bonds", (find_country_observation_date(data["yields"], "United States") or "Unavailable")],
-        [f"{country} 10-year government yield", rf_foreign_pct, "Trading Economics" if data["yields"] is not None and not foreign_yield_override_on else ("Manual override" if foreign_yield_override_on else "Unavailable"), "Trading Economics bonds", (find_country_observation_date(data["yields"], country) or "Unavailable")],
+        ["U.S. 10-year government yield", rf_us_pct, "Manual override" if us_yield_override_on else ("Trading Economics" if auto_us_yield is not None else "Unavailable"), "Trading Economics bonds", (find_country_observation_date(data["yields"], "United States") or "Unavailable") if data["yields"] is not None else "Unavailable"],
+        [f"{country} 10-year government yield", rf_foreign_pct, "Manual override" if foreign_yield_override_on else ("Trading Economics country-specific page" if foreign_yield_from_country_page else ("Trading Economics" if auto_foreign_yield is not None else "Unavailable")), "Trading Economics 10-year bond yield", auto_foreign_yield_date or "Unavailable"],
         ["USD BBB borrowing spread", spread_us_pct, "Damodaran ratings page" if data["bbb_spread"] is not None and not usd_spread_override_on else ("Manual override" if usd_spread_override_on else "Unavailable"), "Damodaran Baa2/BBB", data['bbb_date'] or f"Retrieved {data['fetched_at']}"],
         ["Foreign BBB borrowing spread", spread_foreign_pct, spread_foreign_source, "Converted USD spread or manual input", "Calculated from current selected yields unless manually overridden"],
         ["Equity risk premium", erp_pct, "User assumption (default 6.5%)", "User input", "User assumption"],
