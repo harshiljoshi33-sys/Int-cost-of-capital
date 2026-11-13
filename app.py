@@ -294,13 +294,31 @@ def _extract_te_table(tables):
     for table in tables:
         if isinstance(table.columns, pd.MultiIndex):
             table.columns = [" ".join(str(x) for x in col if str(x) != "nan").strip() for col in table.columns]
-        cols = [re.sub(r"\s+", " ", str(c)).strip().lower() for c in table.columns]
+        # Trading Economics appends sort glyphs (▲/▼) to visible table headings.
+        # Strip glyphs and punctuation before matching semantic column names.
+        cols = [
+            re.sub(r"[^a-z0-9]+", " ", str(c).casefold()).strip()
+            for c in table.columns
+        ]
+        cols = [re.sub(r"\\s+", " ", c) for c in cols]
 
-        country_i = next((i for i, c in enumerate(cols) if c in {"country", "major10y", "major 10y"}), None)
+        country_i = next(
+            (i for i, c in enumerate(cols)
+             if c in {"country", "major10y", "major 10y", "major 10 y"}),
+            None,
+        )
         if country_i is None and cols and (cols[0] == "" or cols[0].startswith("unnamed")):
             country_i = 0
-        yield_i = next((i for i, c in enumerate(cols) if c in {"last", "yield", "10y", "10-year yield"}), None)
-        date_i = next((i for i, c in enumerate(cols) if c in {"reference", "date", "updated"}), None)
+        yield_i = next(
+            (i for i, c in enumerate(cols)
+             if c in {"last", "yield", "10y", "10 year yield", "10 year"}),
+            None,
+        )
+        date_i = next(
+            (i for i, c in enumerate(cols)
+             if c in {"reference", "date", "updated", "last update"}),
+            None,
+        )
         if country_i is None or yield_i is None or date_i is None:
             continue
         for _, row in table.iterrows():
@@ -334,6 +352,8 @@ def fetch_trading_economics_yields():
                 df = pd.DataFrame(records).drop_duplicates("Country", keep="last")
                 if find_country_value(df, "United States", "Country", "Yield") is None:
                     raise ValueError("Parsed yield table did not include the U.S. benchmark.")
+                if find_country_value(df, "Colombia", "Country", "Yield") is None:
+                    raise ValueError("Parsed yield table did not include Colombia; refusing partial country coverage.")
                 return df.sort_values("Country").reset_index(drop=True)
             errors.append(f"{url}: no recognized country/yield/date table")
         except Exception as exc:
@@ -468,8 +488,6 @@ with st.spinner("Loading the latest available source data..."):
 # ---------------------------------------------------------------------
 # Input controls
 # ---------------------------------------------------------------------
-st.header("1. Project assumptions")
-
 beta_df = data["betas"]
 if beta_df is not None and not beta_df.empty:
     industry_options = beta_df["Industry"].tolist()
@@ -627,54 +645,130 @@ else:
     )
     spread_foreign_source = "Automatically converted from USD spread using lecture formula"
 
-# Guard missing data
-if beta_u is None or tax_pct is None or rf_us_pct is None or rf_foreign_pct is None or spread_us_pct is None or (foreign_spread_override_on and spread_foreign_pct is None):
-    st.error("A required source observation is unavailable. Enter a manual override for each missing input before calculating. No illustrative fallback values are used.")
-    st.stop()
+# Determine which currency calculations can be supported by verified inputs.
+# A missing foreign-country observation must never suppress the USD dashboard.
+missing_inputs = []
+for label, value in [
+    ("industry unlevered beta", beta_u),
+    ("selected project tax rate", tax_pct),
+    ("U.S. 10-year government yield", rf_us_pct),
+    ("USD BBB borrowing spread", spread_us_pct),
+]:
+    if value is None:
+        missing_inputs.append(label)
 
-if not (0 <= debt_share_pct < 100):
-    st.error("Debt share must be less than 100%.")
-    st.stop()
+usd_ready = not missing_inputs and 0 <= debt_share_pct < 100
 
-# Calculate the USD baseline once, then calculate foreign currency with optional spread override.
-try:
-    # The calculation function uses a single spread for both currencies by default.
-    base_results = calculate_costs(
-        beta_u, debt_share_pct, tax_pct, erp_pct,
-        rf_us_pct, rf_foreign_pct, spread_us_pct,
-        foreign_spread_pct if foreign_spread_override_on else None,
-    )
-except Exception as exc:
-    st.error(f"Unable to calculate: {exc}")
-    st.stop()
+foreign_missing = []
+if rf_foreign_pct is None:
+    foreign_missing.append(f"{country} 10-year government yield")
+if foreign_spread_override_on and spread_foreign_pct is None:
+    foreign_missing.append(f"{country} BBB borrowing spread")
+
+foreign_ready = usd_ready and not foreign_missing
+
+base_results = None
+if usd_ready:
+    try:
+        # USD calculations do not depend on the foreign-country yield.
+        d = debt_share_pct / 100.0
+        tau = tax_pct / 100.0
+        erp = erp_pct / 100.0
+        rf_us = rf_us_pct / 100.0
+        spread_us = spread_us_pct / 100.0
+        de = d / (1.0 - d)
+        beta_e = beta_u * (1.0 + (1.0 - tau) * de)
+        re_us = rf_us + beta_e * erp
+        rd_us = rf_us + spread_us
+        wacc_us = (1.0 - d) * re_us + d * rd_us * (1.0 - tau)
+        base_results = {
+            "de_ratio": de,
+            "beta_e": beta_e,
+            "re_us": re_us,
+            "rd_us": rd_us,
+            "after_tax_rd_us": rd_us * (1.0 - tau),
+            "wacc_us": wacc_us,
+            "re_foreign": None,
+            "rd_foreign": None,
+            "after_tax_rd_foreign": None,
+            "wacc_foreign": None,
+            "spread_foreign": None,
+        }
+
+        if foreign_ready:
+            foreign_results = calculate_costs(
+                beta_u, debt_share_pct, tax_pct, erp_pct,
+                rf_us_pct, rf_foreign_pct, spread_us_pct,
+                spread_foreign_pct if foreign_spread_override_on else None,
+            )
+            for key in ("re_foreign", "rd_foreign", "after_tax_rd_foreign",
+                        "wacc_foreign", "spread_foreign"):
+                base_results[key] = foreign_results[key]
+    except Exception as exc:
+        st.error(f"Unable to calculate using the selected inputs: {exc}")
+        usd_ready = False
+        foreign_ready = False
+        base_results = None
 
 # ---------------------------------------------------------------------
-# Main dashboard: results first, with no numbered technical sections.
+# Main dashboard: always visible, even when a source is unavailable.
 # ---------------------------------------------------------------------
 st.header("Cost of capital dashboard")
-st.caption(
-    f"{industry} | United States vs. {country} | "
-    f"Project tax rate: {tax_pct:.2f}% ({tax_source_choice})"
+tax_caption = (
+    f"{tax_pct:.2f}% ({tax_source_choice})"
+    if tax_pct is not None else f"Unavailable ({tax_source_choice})"
 )
+st.caption(f"{industry} | United States vs. {country} | Project tax rate: {tax_caption}")
+
+def display_metric(value, is_decimal_rate=True):
+    if value is None:
+        return "Unavailable"
+    number = pct_from_decimal(value) if is_decimal_rate else value
+    return f"{number:.2f}%" if is_decimal_rate else f"{number:.4f}"
 
 usd_col, foreign_col = st.columns(2)
 with usd_col:
     st.subheader("🇺🇸 U.S. dollars (USD)")
-    st.metric("Cost of equity", f"{pct_from_decimal(base_results['re_us']):.2f}%")
-    st.metric("Pre-tax cost of debt", f"{pct_from_decimal(base_results['rd_us']):.2f}%")
-    st.metric("After-tax cost of debt", f"{pct_from_decimal(base_results['after_tax_rd_us']):.2f}%")
-    st.metric("WACC", f"{pct_from_decimal(base_results['wacc_us']):.2f}%")
+    if base_results is None:
+        st.metric("Cost of equity", "Unavailable")
+        st.metric("Pre-tax cost of debt", "Unavailable")
+        st.metric("After-tax cost of debt", "Unavailable")
+        st.metric("WACC", "Unavailable")
+    else:
+        st.metric("Cost of equity", display_metric(base_results["re_us"]))
+        st.metric("Pre-tax cost of debt", display_metric(base_results["rd_us"]))
+        st.metric("After-tax cost of debt", display_metric(base_results["after_tax_rd_us"]))
+        st.metric("WACC", display_metric(base_results["wacc_us"]))
+
 with foreign_col:
     st.subheader(f"🌎 {country} currency")
-    st.metric("Cost of equity", f"{pct_from_decimal(base_results['re_foreign']):.2f}%")
-    st.metric("Pre-tax cost of debt", f"{pct_from_decimal(base_results['rd_foreign']):.2f}%")
-    st.metric("After-tax cost of debt", f"{pct_from_decimal(base_results['after_tax_rd_foreign']):.2f}%")
-    st.metric("WACC", f"{pct_from_decimal(base_results['wacc_foreign']):.2f}%")
+    if not foreign_ready or base_results is None:
+        st.metric("Cost of equity", "Unavailable")
+        st.metric("Pre-tax cost of debt", "Unavailable")
+        st.metric("After-tax cost of debt", "Unavailable")
+        st.metric("WACC", "Unavailable")
+    else:
+        st.metric("Cost of equity", display_metric(base_results["re_foreign"]))
+        st.metric("Pre-tax cost of debt", display_metric(base_results["rd_foreign"]))
+        st.metric("After-tax cost of debt", display_metric(base_results["after_tax_rd_foreign"]))
+        st.metric("WACC", display_metric(base_results["wacc_foreign"]))
 
-st.divider()
+if not usd_ready:
+    st.warning(
+        "USD results are unavailable because these required inputs are missing: "
+        + ", ".join(missing_inputs)
+        + ". Enter verified manual overrides in the sidebar. The dashboard remains available."
+    )
+elif not foreign_ready:
+    st.info(
+        f"USD results are available. {country} results are waiting for: "
+        + ", ".join(foreign_missing)
+        + ". Enter a verified manual override in the sidebar."
+    )
+
 st.caption(
-    "Inputs and overrides are available in the left sidebar. "
-    "Technical source details, calculation bridges, verification checks and downloads are below."
+    "Adjust assumptions and manual overrides in the left sidebar. "
+    "Source diagnostics, supporting analysis and verification checks are kept below."
 )
 
 with st.expander("Technical details & validation", expanded=False):
@@ -730,13 +824,13 @@ with st.expander("Technical details & validation", expanded=False):
         [f"{country} 10-year yield (%)", rf_foreign_pct],
         ["USD BBB spread (%)", spread_us_pct],
         ["Foreign BBB spread (%)", spread_foreign_pct],
-        ["Relevered beta", base_results["beta_e"]],
-        ["USD cost of equity (%)", pct_from_decimal(base_results["re_us"])],
-        ["Foreign cost of equity (%)", pct_from_decimal(base_results["re_foreign"])],
-        ["USD pre-tax cost of debt (%)", pct_from_decimal(base_results["rd_us"])],
-        ["Foreign pre-tax cost of debt (%)", pct_from_decimal(base_results["rd_foreign"])],
-        ["USD WACC (%)", pct_from_decimal(base_results["wacc_us"])],
-        ["Foreign WACC (%)", pct_from_decimal(base_results["wacc_foreign"])],
+        ["Relevered beta", base_results["beta_e"] if base_results else None],
+        ["USD cost of equity (%)", pct_from_decimal(base_results["re_us"]) if base_results else None],
+        ["Foreign cost of equity (%)", pct_from_decimal(base_results["re_foreign"]) if base_results and base_results["re_foreign"] is not None else None],
+        ["USD pre-tax cost of debt (%)", pct_from_decimal(base_results["rd_us"]) if base_results else None],
+        ["Foreign pre-tax cost of debt (%)", pct_from_decimal(base_results["rd_foreign"]) if base_results and base_results["rd_foreign"] is not None else None],
+        ["USD WACC (%)", pct_from_decimal(base_results["wacc_us"]) if base_results else None],
+        ["Foreign WACC (%)", pct_from_decimal(base_results["wacc_foreign"]) if base_results and base_results["wacc_foreign"] is not None else None],
     ], columns=["Input / output", "Value"])
 
     csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
@@ -765,7 +859,7 @@ with st.expander("All-industry comparison", expanded=False):
         "This table holds the selected country, tax rate, ERP, debt share, yields, "
         "and borrowing spreads constant while varying only the industry unlevered beta."
     )
-    if beta_df is not None and not beta_df.empty:
+    if foreign_ready and base_results is not None and beta_df is not None and not beta_df.empty:
         industry_results = []
         for _, row in beta_df.iterrows():
             b = safe_float(row["Unlevered Beta"])
@@ -812,66 +906,68 @@ with st.expander("All-industry comparison", expanded=False):
 # ---------------------------------------------------------------------
 with st.expander("Built-in verification checks", expanded=False):
     st.caption("These checks are designed around the assignment's required invariants.")
+    if not foreign_ready or base_results is None:
+        st.info("Verification checks will run when all required inputs are available.")
+    else:
+        # Equal yields => same currency results when spread override is off.
+        equal_yield_test = calculate_costs(
+            beta_u, debt_share_pct, tax_pct, erp_pct,
+            rf_us_pct, rf_us_pct, spread_us_pct
+        )
+        equal_yield_pass = (
+            abs(equal_yield_test["re_us"] - equal_yield_test["re_foreign"]) < 1e-12
+            and abs(equal_yield_test["rd_us"] - equal_yield_test["rd_foreign"]) < 1e-12
+            and abs(equal_yield_test["wacc_us"] - equal_yield_test["wacc_foreign"]) < 1e-12
+        )
 
-    # Equal yields => same currency results when spread override is off.
-    equal_yield_test = calculate_costs(
-        beta_u, debt_share_pct, tax_pct, erp_pct,
-        rf_us_pct, rf_us_pct, spread_us_pct
-    )
-    equal_yield_pass = (
-        abs(equal_yield_test["re_us"] - equal_yield_test["re_foreign"]) < 1e-12
-        and abs(equal_yield_test["rd_us"] - equal_yield_test["rd_foreign"]) < 1e-12
-        and abs(equal_yield_test["wacc_us"] - equal_yield_test["wacc_foreign"]) < 1e-12
-    )
+        # Zero debt => WACC equals cost of equity in both currencies.
+        zero_debt_test = calculate_costs(
+            beta_u, 0.0, tax_pct, erp_pct,
+            rf_us_pct, rf_foreign_pct, spread_us_pct,
+            spread_foreign_pct if foreign_spread_override_on else None,
+        )
+        zero_debt_pass = (
+            abs(zero_debt_test["wacc_us"] - zero_debt_test["re_us"]) < 1e-12
+            and abs(zero_debt_test["wacc_foreign"] - zero_debt_test["re_foreign"]) < 1e-12
+        )
 
-    # Zero debt => WACC equals cost of equity in both currencies.
-    zero_debt_test = calculate_costs(
-        beta_u, 0.0, tax_pct, erp_pct,
-        rf_us_pct, rf_foreign_pct, spread_us_pct,
-        spread_foreign_pct if foreign_spread_override_on else None,
-    )
-    zero_debt_pass = (
-        abs(zero_debt_test["wacc_us"] - zero_debt_test["re_us"]) < 1e-12
-        and abs(zero_debt_test["wacc_foreign"] - zero_debt_test["re_foreign"]) < 1e-12
-    )
+        # Foreign spread override must not alter USD-side outputs.
+        usd_before = calculate_costs(
+            beta_u, debt_share_pct, tax_pct, erp_pct,
+            rf_us_pct, rf_foreign_pct, spread_us_pct,
+            spread_foreign_pct if foreign_spread_override_on else None,
+        )
+        _test_foreign_spread = max(0.0, spread_foreign_pct + 1.0)
+        usd_after = calculate_costs(
+            beta_u, debt_share_pct, tax_pct, erp_pct,
+            rf_us_pct, rf_foreign_pct, spread_us_pct, _test_foreign_spread,
+        )
+        foreign_override_invariance_pass = (
+            abs(usd_before["re_us"] - usd_after["re_us"]) < 1e-12
+            and abs(usd_before["rd_us"] - usd_after["rd_us"]) < 1e-12
+            and abs(usd_before["wacc_us"] - usd_after["wacc_us"]) < 1e-12
+        )
 
-    # Foreign spread override must not alter USD-side outputs.
-    usd_before = calculate_costs(
-        beta_u, debt_share_pct, tax_pct, erp_pct,
-        rf_us_pct, rf_foreign_pct, spread_us_pct,
-        spread_foreign_pct if foreign_spread_override_on else None,
-    )
-    _test_foreign_spread = max(0.0, spread_foreign_pct + 1.0)
-    usd_after = calculate_costs(
-        beta_u, debt_share_pct, tax_pct, erp_pct,
-        rf_us_pct, rf_foreign_pct, spread_us_pct, _test_foreign_spread,
-    )
-    foreign_override_invariance_pass = (
-        abs(usd_before["re_us"] - usd_after["re_us"]) < 1e-12
-        and abs(usd_before["rd_us"] - usd_after["rd_us"]) < 1e-12
-        and abs(usd_before["wacc_us"] - usd_after["wacc_us"]) < 1e-12
-    )
-
-    checks = [
-        ("Equal government yields", equal_yield_pass,
-         "With identical yields and the automatic foreign-spread conversion, USD and foreign-currency results match."),
-        ("Zero debt share", zero_debt_pass,
-         "At 0% debt, WACC equals cost of equity in both currencies."),
-        ("Foreign spread override isolation", foreign_override_invariance_pass,
-         "Changing the foreign spread is isolated from USD cost of debt and USD WACC."),
-    ]
-    for name, passed, detail in checks:
-        col1, col2 = st.columns([1, 5])
-        with col1:
-            if name == "Equal government yields" and foreign_spread_override_on:
-                st.info("N/A")
-            elif passed:
-                st.success("PASS")
-            else:
-                st.error("FAIL")
-        with col2:
-            if name == "Equal government yields" and foreign_spread_override_on:
-                st.write(f"**{name}** — Not applicable while the foreign spread is manually overridden.")
-            else:
-                st.write(f"**{name}** — {detail}")
+        checks = [
+            ("Equal government yields", equal_yield_pass,
+             "With identical yields and the automatic foreign-spread conversion, USD and foreign-currency results match."),
+            ("Zero debt share", zero_debt_pass,
+             "At 0% debt, WACC equals cost of equity in both currencies."),
+            ("Foreign spread override isolation", foreign_override_invariance_pass,
+             "Changing the foreign spread is isolated from USD cost of debt and USD WACC."),
+        ]
+        for name, passed, detail in checks:
+            col1, col2 = st.columns([1, 5])
+            with col1:
+                if name == "Equal government yields" and foreign_spread_override_on:
+                    st.info("N/A")
+                elif passed:
+                    st.success("PASS")
+                else:
+                    st.error("FAIL")
+            with col2:
+                if name == "Equal government yields" and foreign_spread_override_on:
+                    st.write(f"**{name}** — Not applicable while the foreign spread is manually overridden.")
+                else:
+                    st.write(f"**{name}** — {detail}")
 
